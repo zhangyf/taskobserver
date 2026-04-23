@@ -1,0 +1,4 @@
+taskobserver
+cmd/taskobserver
+cmd/go.sum
+*.log
