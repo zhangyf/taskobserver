@@ -20,7 +20,9 @@ func levelClass(line string) string {
 	}
 }
 
-func buildTaskHTML(taskName string, lines []string, current, total int, done bool, shards []string) string {
+// buildTaskHTML 构建任务详情页 HTML。
+// status: running / completed / failed / killed
+func buildTaskHTML(taskName string, lines []string, current, total int, status Status, shards []string) string {
 	pct := 0
 	if total > 0 {
 		pct = current * 100 / total
@@ -28,12 +30,16 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
 			pct = 100
 		}
 	}
-	if done {
-		pct = 100
-	}
+
 	statusText, statusIcon, statusColor, barClass := "Running", "🔄", "#1677ff", ""
-	if done {
+	switch status {
+	case StatusCompleted:
 		statusText, statusIcon, statusColor, barClass = "Completed", "✅", "#52c41a", " done"
+		pct = 100
+	case StatusFailed:
+		statusText, statusIcon, statusColor, barClass = "Failed", "❌", "#cf1322", " failed"
+	case StatusKilled:
+		statusText, statusIcon, statusColor, barClass = "Killed", "💀", "#874d00", " killed"
 	}
 
 	var logLines strings.Builder
@@ -54,10 +60,35 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
 		shardsHTML.WriteString("  </div>\n")
 	}
 
-	autoRefreshJS := "startRefresh();"
-	if done {
-		autoRefreshJS = "// task done"
+	// 任务结束后停止自动刷新；running 时继续轮询，同时检测心跳超时
+	autoRefreshJS := fmt.Sprintf(`startRefresh();
+  // 心跳超时检测：若 %d 秒未更新则标记为 Killed
+  (function(){
+    var HB_TIMEOUT=%d;
+    setInterval(function(){
+      fetch(location.href+'?t='+Date.now()).then(function(r){return r.text();})
+      .then(function(h){
+        var doc=new DOMParser().parseFromString(h,'text/html');
+        var hbEl=doc.getElementById('heartbeat-ts');
+        if(!hbEl)return;
+        var ts=parseInt(hbEl.textContent||'0');
+        if(ts>0 && (Date.now()/1000-ts)>HB_TIMEOUT){
+          var badge=document.getElementById('badge');
+          if(badge&&badge.textContent.indexOf('Running')>=0){
+            badge.textContent='💀 Killed (no heartbeat)';
+            badge.style.color='#874d00';
+            stopRefresh();
+          }
+        }
+      }).catch(function(){});
+    },15000);
+  })();`, HeartbeatTimeout, HeartbeatTimeout)
+
+	if status != StatusRunning {
+		autoRefreshJS = "// task finished, auto-refresh stopped"
 	}
+
+	heartbeatTS := fmt.Sprintf(`<span id="heartbeat-ts" style="display:none">%d</span>`, time.Now().Unix())
 
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>%s — Task Log</title>
@@ -76,6 +107,8 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
   .progress-track{height:8px;background:#e8e8e8;border-radius:4px;overflow:hidden}
   .progress-bar{height:100%%;border-radius:4px;background:linear-gradient(90deg,#1677ff,#4096ff);transition:width .4s ease}
   .progress-bar.done{background:linear-gradient(90deg,#52c41a,#73d13d)}
+  .progress-bar.failed{background:linear-gradient(90deg,#cf1322,#ff4d4f)}
+  .progress-bar.killed{background:linear-gradient(90deg,#874d00,#d46b08)}
   .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
   .toolbar-left{font-size:12px;color:#888}
   .toolbar-right{display:flex;align-items:center;gap:10px}
@@ -101,7 +134,7 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
     <span><a class="back" href="../../index.html">← 返回总览</a><span class="title">📋 %s</span></span>
     <span class="badge" id="badge">%s %s</span>
   </div>
-  <div class="meta" id="meta">最后更新：%s</div>
+  <div class="meta" id="meta">最后更新：%s %s</div>
   <div class="progress-wrap">
     <div class="progress-label" id="progress-label"><span>进度</span><span>%d / %d &nbsp;(%d%%)</span></div>
     <div class="progress-track"><div class="progress-bar%s" id="progress-bar" style="width:%d%%"></div></div>
@@ -145,7 +178,7 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
       else if(ns)document.querySelector('.card').appendChild(ns.cloneNode(true));
       scrollBottom();rebuildDownload();
       var badge=document.getElementById('badge');
-      if(badge&&badge.textContent.indexOf('Completed')>=0)stopRefresh();
+      if(badge&&(badge.textContent.indexOf('Completed')>=0||badge.textContent.indexOf('Failed')>=0||badge.textContent.indexOf('Killed')>=0))stopRefresh();
     }).catch(function(){});
   }
   function startRefresh(){if(timer)clearInterval(timer);timer=setInterval(doRefresh,getInterval());autoOn=true;rb.textContent='ON';rb.className='btn-toggle active';}
@@ -160,7 +193,7 @@ func buildTaskHTML(taskName string, lines []string, current, total int, done boo
 		statusColor, statusColor, statusColor,
 		html.EscapeString(taskName),
 		statusIcon, statusText,
-		now,
+		now, heartbeatTS,
 		current, total, pct,
 		barClass, pct,
 		len(lines), windowSize,

@@ -2,13 +2,7 @@
 //
 // 基本用法：
 //
-//	obs := taskobserver.New(taskobserver.Config{
-//	    Bucket:    "my-bucket",
-//	    Region:    "ap-nanjing",
-//	    SecretID:  "AKIDxxx",
-//	    SecretKey: "xxxxx",
-//	    TaskName:  "数据迁移",
-//	})
+//	obs := taskobserver.New(taskobserver.Config{...})
 //	log.SetOutput(obs.Writer())
 //	obs.Start(func() (int, int) { return current, total })
 //	defer obs.Done()
@@ -19,9 +13,24 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// Status 任务状态
+type Status string
+
+const (
+	StatusRunning   Status = "running"
+	StatusCompleted Status = "completed"
+	StatusFailed    Status = "failed"
+	StatusKilled    Status = "killed"
+)
+
+// HeartbeatTimeout 前端判断进程已死的超时阈值（秒），写入页面供 JS 使用
+const HeartbeatTimeout = 120
 
 // Config 是 Observer 的全部配置，零值之外的字段均为必填。
 type Config struct {
@@ -72,11 +81,11 @@ type Observer struct {
 	progressFn func() (int, int)
 	doneCh     chan struct{}
 	finishedCh chan struct{} // watchLoop 完成后关闭
+	finalStatus Status
 	startTime  string
 }
 
-// New 创建一个 Observer，失败（配置不合法）时 panic。
-// 如需处理错误请用 NewWithError。
+// New 创建一个 Observer，失败时 panic。
 func New(cfg Config) *Observer {
 	obs, err := NewWithError(cfg)
 	if err != nil {
@@ -94,16 +103,16 @@ func NewWithError(cfg Config) (*Observer, error) {
 	rl := newRingLogger(cfg.TaskName, cfg.ExtraWriter)
 	rl.setCOS(c)
 	return &Observer{
-		cfg:        cfg,
-		cos:        c,
-		rl:         rl,
-		doneCh:     make(chan struct{}),
-		finishedCh: make(chan struct{}),
+		cfg:         cfg,
+		cos:         c,
+		rl:          rl,
+		doneCh:      make(chan struct{}),
+		finishedCh:  make(chan struct{}),
+		finalStatus: StatusCompleted,
 	}, nil
 }
 
 // Writer 返回一个 io.Writer，可直接传给 log.SetOutput 或 slog.NewTextHandler。
-// 所有写入内容会进入滑动窗口并按分片上传到 COS。
 func (o *Observer) Writer() io.Writer {
 	return o.rl
 }
@@ -113,30 +122,45 @@ func (o *Observer) NewSlogLogger() *slog.Logger {
 	return newSlogLogger(o.rl)
 }
 
-// Start 启动后台推送循环。
+// Start 启动后台推送循环，并注册信号处理（SIGTERM/SIGINT → killed）。
 // progressFn 每次推送前调用，返回 (current, total)；传 nil 则进度条不动。
 // Start 是非阻塞的，立即返回。
 func (o *Observer) Start(progressFn func() (int, int)) {
 	o.progressFn = progressFn
 	o.startTime = time.Now().Format("2006-01-02 15:04:05")
+
 	// 注册任务到总览页
 	upsertRegistry(o.cos, o.cfg.BaseURL, taskMeta{
-		Name:      o.cfg.TaskName,
-		SafeName:  o.rl.safeName,
-		Status:    "running",
-		Progress:  0,
-		StartTime: o.startTime,
-		PageURL:   o.taskPageURL(),
+		Name:          o.cfg.TaskName,
+		SafeName:      o.rl.safeName,
+		Status:        string(StatusRunning),
+		Progress:      0,
+		StartTime:     o.startTime,
+		PageURL:       o.taskPageURL(),
+		LastHeartbeat: time.Now().Unix(),
 	})
 	uploadIndexPage(o.cos, o.cfg.BaseURL)
 
+	// 监听 SIGTERM / SIGINT，写入 killed 状态后退出
+	go o.handleSignals()
 	go o.watchLoop()
 }
 
-// Done 标记任务完成，阴塞直到最终页面上传完成。
+// Done 标记任务成功完成，阻塞直到最终页面上传完成。
 func (o *Observer) Done() {
+	o.finalStatus = StatusCompleted
 	close(o.doneCh)
-	<-o.finishedCh // 真正等待 watchLoop 返回
+	<-o.finishedCh
+}
+
+// Fail 标记任务失败，阻塞直到最终页面上传完成。
+func (o *Observer) Fail(err error) {
+	if err != nil {
+		o.Log("任务失败", "error", err.Error())
+	}
+	o.finalStatus = StatusFailed
+	close(o.doneCh)
+	<-o.finishedCh
 }
 
 // Log 直接写一行日志（level=INFO）。
@@ -162,9 +186,28 @@ func (o *Observer) taskPageKey() string {
 	return fmt.Sprintf("tasks/%s/index.html", o.rl.safeName)
 }
 
+// handleSignals 捕获 SIGTERM/SIGINT，将状态置为 killed 后触发 watchLoop 结束。
+func (o *Observer) handleSignals() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-ch
+	fmt.Fprintf(os.Stderr, "\ntaskobserver: received signal %v, marking task as killed\n", sig)
+	o.Log("进程收到信号，任务标记为 killed", "signal", sig.String())
+	o.finalStatus = StatusKilled
+	// 关闭 doneCh 触发 watchLoop 最终推送（如果还没关闭）
+	select {
+	case <-o.doneCh:
+	default:
+		close(o.doneCh)
+	}
+	<-o.finishedCh
+	os.Exit(1)
+}
+
 func (o *Observer) watchLoop() {
 	defer close(o.finishedCh)
-	push := func(isDone bool) {
+
+	push := func(status Status) {
 		cur, tot := 0, 0
 		if o.progressFn != nil {
 			cur, tot = o.progressFn()
@@ -173,29 +216,37 @@ func (o *Observer) watchLoop() {
 		if tot > 0 {
 			pct = cur * 100 / tot
 		}
+		isDone := status != StatusRunning
 		if isDone {
 			pct = 100
 		}
+		if status == StatusKilled || status == StatusFailed {
+			// killed/failed 保留真实进度，不强制100%
+			if tot > 0 {
+				pct = cur * 100 / tot
+			}
+		}
+
 		lines := o.rl.window()
 		shards := o.rl.shards()
-		page := buildTaskHTML(o.cfg.TaskName, lines, cur, tot, isDone, shards)
+		page := buildTaskHTML(o.cfg.TaskName, lines, cur, tot, status, shards)
 		if err := o.cos.putString(o.taskPageKey(), "text/html; charset=utf-8", page); err != nil {
 			fmt.Fprintf(os.Stderr, "taskobserver: upload task page: %v\n", err)
 		}
-		status := "running"
+
 		endTime := ""
 		if isDone {
-			status = "completed"
 			endTime = time.Now().Format("2006-01-02 15:04:05")
 		}
 		upsertRegistry(o.cos, o.cfg.BaseURL, taskMeta{
-			Name:      o.cfg.TaskName,
-			SafeName:  o.rl.safeName,
-			Status:    status,
-			Progress:  pct,
-			StartTime: o.startTime,
-			EndTime:   endTime,
-			PageURL:   o.taskPageURL(),
+			Name:          o.cfg.TaskName,
+			SafeName:      o.rl.safeName,
+			Status:        string(status),
+			Progress:      pct,
+			StartTime:     o.startTime,
+			EndTime:       endTime,
+			PageURL:       o.taskPageURL(),
+			LastHeartbeat: time.Now().Unix(),
 		})
 		uploadIndexPage(o.cos, o.cfg.BaseURL)
 	}
@@ -204,22 +255,15 @@ func (o *Observer) watchLoop() {
 		select {
 		case <-o.doneCh:
 			o.rl.flush()
-			push(true)
+			push(o.finalStatus)
 			return
 		case <-time.After(o.cfg.Interval):
-			push(false)
+			push(StatusRunning)
 		}
 	}
 }
 
-// ConfigFromEnv 从环境变量读取配置，方便不想硬编码的场景。
-//
-//	TASKOBS_BUCKET      必填
-//	TASKOBS_REGION      必填
-//	TASKOBS_SECRET_ID   必填
-//	TASKOBS_SECRET_KEY  必填
-//	TASKOBS_BASE_URL    选填
-//	TASKOBS_TASK        选填（也可在代码里覆盖）
+// ConfigFromEnv 从环境变量读取配置。
 func ConfigFromEnv() Config {
 	return Config{
 		Bucket:    os.Getenv("TASKOBS_BUCKET"),

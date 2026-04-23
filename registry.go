@@ -9,13 +9,14 @@ import (
 )
 
 type taskMeta struct {
-	Name      string `json:"name"`
-	SafeName  string `json:"safe_name"`
-	Status    string `json:"status"`
-	Progress  int    `json:"progress"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time,omitempty"`
-	PageURL   string `json:"page_url"`
+	Name          string `json:"name"`
+	SafeName      string `json:"safe_name"`
+	Status        string `json:"status"`
+	Progress      int    `json:"progress"`
+	StartTime     string `json:"start_time"`
+	EndTime       string `json:"end_time,omitempty"`
+	PageURL       string `json:"page_url"`
+	LastHeartbeat int64  `json:"last_heartbeat,omitempty"`
 }
 
 var registryMu sync.Mutex
@@ -73,10 +74,19 @@ func buildIndexHTML(tasks []taskMeta, baseURL string) string {
 	var rows string
 	for _, t := range tasks {
 		icon, color, statusText := "🔄", "#1677ff", "Running"
-		if t.Status == "completed" {
+		switch t.Status {
+		case "completed":
 			icon, color, statusText = "✅", "#52c41a", "Completed"
-		} else if t.Status == "failed" {
+		case "failed":
 			icon, color, statusText = "❌", "#cf1322", "Failed"
+		case "killed":
+			icon, color, statusText = "💀", "#874d00", "Killed"
+		}
+		// running 状态下检测心跳超时 → 显示为 killed
+		if t.Status == "running" && t.LastHeartbeat > 0 {
+			if time.Now().Unix()-t.LastHeartbeat > HeartbeatTimeout {
+				icon, color, statusText = "💀", "#874d00", "Killed (no heartbeat)"
+			}
 		}
 		endCell := "-"
 		if t.EndTime != "" {
