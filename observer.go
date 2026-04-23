@@ -71,6 +71,7 @@ type Observer struct {
 	rl         *RingLogger
 	progressFn func() (int, int)
 	doneCh     chan struct{}
+	finishedCh chan struct{} // watchLoop 完成后关闭
 	startTime  string
 }
 
@@ -92,10 +93,11 @@ func NewWithError(cfg Config) (*Observer, error) {
 	c := newCOSClient(cfg.Bucket, cfg.Region, cfg.SecretID, cfg.SecretKey)
 	rl := newRingLogger(cfg.TaskName, cfg.ExtraWriter)
 	return &Observer{
-		cfg:    cfg,
-		cos:    c,
-		rl:     rl,
-		doneCh: make(chan struct{}),
+		cfg:        cfg,
+		cos:        c,
+		rl:         rl,
+		doneCh:     make(chan struct{}),
+		finishedCh: make(chan struct{}),
 	}, nil
 }
 
@@ -130,12 +132,10 @@ func (o *Observer) Start(progressFn func() (int, int)) {
 	go o.watchLoop()
 }
 
-// Done 标记任务完成：上传剩余分片、最终推送页面（状态=Completed）、更新总览。
-// Done 会阻塞直到最终页面上传完毕。
+// Done 标记任务完成，阴塞直到最终页面上传完成。
 func (o *Observer) Done() {
 	close(o.doneCh)
-	// 留足时间让 watchLoop goroutine 完成最终推送
-	time.Sleep(200 * time.Millisecond)
+	<-o.finishedCh // 真正等待 watchLoop 返回
 }
 
 // Log 直接写一行日志（level=INFO）。
@@ -162,6 +162,7 @@ func (o *Observer) taskPageKey() string {
 }
 
 func (o *Observer) watchLoop() {
+	defer close(o.finishedCh)
 	push := func(isDone bool) {
 		cur, tot := 0, 0
 		if o.progressFn != nil {
