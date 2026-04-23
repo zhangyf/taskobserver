@@ -34,8 +34,28 @@ type RingLogger struct {
 	extra  io.Writer // 同时写到这里（如 os.Stderr）
 }
 
+func safeName(taskName string) string {
+	var sb strings.Builder
+	for _, r := range taskName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteRune('_')
+		}
+	}
+	// 去掉首尾下划线、并归连续下划线
+	s := strings.Trim(sb.String(), "_")
+	for strings.Contains(s, "__") {
+		s = strings.ReplaceAll(s, "__", "_")
+	}
+	if s == "" {
+		s = "task"
+	}
+	return s
+}
+
 func newRingLogger(taskName string, extra io.Writer) *RingLogger {
-	safe := strings.NewReplacer(" ", "_", "/", "-", ":", "-").Replace(taskName)
+	safe := safeName(taskName)
 	runID := time.Now().Format("20060102-150405")
 	return &RingLogger{
 		taskName: taskName,
