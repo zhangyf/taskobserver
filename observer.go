@@ -92,6 +92,7 @@ func NewWithError(cfg Config) (*Observer, error) {
 	}
 	c := newCOSClient(cfg.Bucket, cfg.Region, cfg.SecretID, cfg.SecretKey)
 	rl := newRingLogger(cfg.TaskName, cfg.ExtraWriter)
+	rl.setCOS(c)
 	return &Observer{
 		cfg:        cfg,
 		cos:        c,

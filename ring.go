@@ -30,6 +30,8 @@ type RingLogger struct {
 	shardIdx int
 	shardURLs []string
 
+	uploadWg sync.WaitGroup // 跟踪所有分片上传 goroutine
+
 	cos    *cosClient
 	extra  io.Writer // 同时写到这里（如 os.Stderr）
 }
@@ -107,7 +109,9 @@ func (r *RingLogger) uploadShard() {
 	r.pending = r.pending[:0]
 
 	c := r.cos
+	r.uploadWg.Add(1)
 	go func() {
+		defer r.uploadWg.Done()
 		if _, err := c.putGzip(key, lines); err != nil {
 			fmt.Fprintf(os.Stderr, "taskobserver: shard upload: %v\n", err)
 			return
@@ -119,12 +123,12 @@ func (r *RingLogger) uploadShard() {
 	}()
 }
 
-// flush 上传剩余不足 shardSize 的行（任务完成时调用）。
+// flush 上传剩余不足 shardSize 的行，并等待所有分片上传完成。
 func (r *RingLogger) flush() {
 	r.mu.Lock()
 	r.uploadShard()
 	r.mu.Unlock()
-	time.Sleep(600 * time.Millisecond) // 等异步 goroutine 完成
+	r.uploadWg.Wait() // 真正等待所有分片上传 goroutine 返回
 }
 
 func (r *RingLogger) window() []string {
