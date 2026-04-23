@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 )
 
 type taskMeta struct {
@@ -70,7 +69,6 @@ func uploadIndexPage(c *cosClient, baseURL string) {
 }
 
 func buildIndexHTML(_ []taskMeta, _ string) string {
-	now := time.Now().Format("2006-01-02 15:04:05 Z07:00")
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>任务总览</title>
 <style>
@@ -166,5 +164,5 @@ func buildIndexHTML(_ []taskMeta, _ string) string {
   startRefresh();
 </script>
 </body></html>
-`, now, HeartbeatTimeout)
+`, HeartbeatTimeout)
 }
