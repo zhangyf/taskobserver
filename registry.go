@@ -69,44 +69,7 @@ func uploadIndexPage(c *cosClient, baseURL string) {
 	}
 }
 
-func buildIndexHTML(tasks []taskMeta, baseURL string) string {
-	_ = baseURL
-	var rows string
-	for _, t := range tasks {
-		icon, color, statusText := "🔄", "#1677ff", "Running"
-		switch t.Status {
-		case "completed":
-			icon, color, statusText = "✅", "#52c41a", "Completed"
-		case "failed":
-			icon, color, statusText = "❌", "#cf1322", "Failed"
-		case "killed":
-			icon, color, statusText = "💀", "#874d00", "Killed"
-		}
-		// running 状态下检测心跳超时 → 显示为 killed
-		if t.Status == "running" && t.LastHeartbeat > 0 {
-			if time.Now().Unix()-t.LastHeartbeat > HeartbeatTimeout {
-				icon, color, statusText = "💀", "#874d00", "Killed (no heartbeat)"
-			}
-		}
-		endCell := "-"
-		if t.EndTime != "" {
-			endCell = t.EndTime
-		}
-		rows += fmt.Sprintf(`    <tr>
-      <td><a href="%s" target="_blank">%s</a></td>
-      <td><span style="color:%s;font-weight:500">%s %s</span></td>
-      <td>
-        <div class="mini-track"><div class="mini-bar" style="width:%d%%;background:%s"></div></div>
-        <span class="pct">%d%%</span>
-      </td>
-      <td>%s</td>
-      <td>%s</td>
-    </tr>
-`, t.PageURL, t.Name, color, icon, statusText, t.Progress, color, t.Progress, t.StartTime, endCell)
-	}
-	if len(tasks) == 0 {
-		rows = `    <tr><td colspan="5" style="text-align:center;color:#aaa;padding:32px">暂无任务</td></tr>`
-	}
+func buildIndexHTML(_ []taskMeta, _ string) string {
 	now := time.Now().Format("2006-01-02 15:04:05 Z07:00")
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html lang="zh"><head><meta charset="utf-8"><title>任务总览</title>
@@ -136,7 +99,7 @@ func buildIndexHTML(tasks []taskMeta, baseURL string) string {
 <div class="card">
   <div class="header">
     <span class="title">📋 任务总览</span>
-    <span class="meta" id="meta">最后更新：%s &nbsp;|&nbsp; 共 %d 个任务</span>
+    <span class="meta" id="meta">加载中...</span>
   </div>
   <div class="toolbar">
     <span class="refresh-ctrl">自动刷新 <input id="ri" type="number" value="5" min="1" max="60">秒
@@ -144,29 +107,64 @@ func buildIndexHTML(tasks []taskMeta, baseURL string) string {
   </div>
   <table>
     <thead><tr><th>任务名</th><th>状态</th><th>进度</th><th>开始时间</th><th>结束时间</th></tr></thead>
-    <tbody id="tbody">
-%s    </tbody>
+    <tbody id="tbody"><tr><td colspan="5" style="text-align:center;color:#aaa;padding:32px">加载中...</td></tr></tbody>
   </table>
 </div>
 <script>
-  var timer=null,autoOn=true;
-  var rb=document.getElementById('rb'),ri=document.getElementById('ri');
+  var HEARTBEAT_TIMEOUT = %d;
+  var registryURL = location.href.replace(/\/index\.html(\?.*)?$/, '') + '/tasks/registry.json';
+  var timer=null, autoOn=true;
+  var rb=document.getElementById('rb'), ri=document.getElementById('ri');
   function getInterval(){return Math.max(1,parseInt(ri.value)||5)*1000;}
-  function doRefresh(){
-    fetch(location.href+'?t='+Date.now()).then(function(r){return r.text();}).then(function(h){
-      var doc=new DOMParser().parseFromString(h,'text/html');
-      var nb=doc.getElementById('tbody'),ob=document.getElementById('tbody');
-      if(nb&&ob)ob.innerHTML=nb.innerHTML;
-      var nm=doc.getElementById('meta'),om=document.getElementById('meta');
-      if(nm&&om)om.textContent=nm.textContent;
-    }).catch(function(){});
+  function statusInfo(t) {
+    var now = Math.floor(Date.now()/1000);
+    if (t.status === 'running' && t.last_heartbeat > 0 && now - t.last_heartbeat > HEARTBEAT_TIMEOUT) {
+      return {icon:'💀', color:'#874d00', text:'Killed (no heartbeat)'};
+    }
+    switch(t.status) {
+      case 'completed': return {icon:'✅', color:'#52c41a', text:'Completed'};
+      case 'failed':    return {icon:'❌', color:'#cf1322', text:'Failed'};
+      case 'killed':    return {icon:'💀', color:'#874d00', text:'Killed'};
+      default:          return {icon:'🔄', color:'#1677ff', text:'Running'};
+    }
+  }
+  function render(tasks) {
+    var tbody = document.getElementById('tbody');
+    var meta  = document.getElementById('meta');
+    if (!tasks || tasks.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#aaa;padding:32px">暂无任务</td></tr>';
+      meta.textContent = '最后更新：' + new Date().toLocaleString() + ' | 共 0 个任务';
+      return;
+    }
+    var html = '';
+    tasks.forEach(function(t) {
+      var s = statusInfo(t);
+      var pct = t.progress || 0;
+      var end = t.end_time || '-';
+      html += '<tr>';
+      html += '<td><a href="' + t.page_url + '" target="_blank">' + t.name + '</a></td>';
+      html += '<td><span style="color:' + s.color + ';font-weight:500">' + s.icon + ' ' + s.text + '</span></td>';
+      html += '<td><div class="mini-track"><div class="mini-bar" style="width:' + pct + '%%;background:' + s.color + '"></div></div><span class="pct">' + pct + '%%</span></td>';
+      html += '<td>' + (t.start_time || '-') + '</td>';
+      html += '<td>' + end + '</td>';
+      html += '</tr>';
+    });
+    tbody.innerHTML = html;
+    meta.textContent = '最后更新：' + new Date().toLocaleString() + ' | 共 ' + tasks.length + ' 个任务';
+  }
+  function doRefresh() {
+    fetch(registryURL + '?t=' + Date.now())
+      .then(function(r){return r.json();})
+      .then(function(tasks){render(tasks);})
+      .catch(function(){});
   }
   function startRefresh(){if(timer)clearInterval(timer);timer=setInterval(doRefresh,getInterval());autoOn=true;rb.textContent='ON';rb.className='btn-toggle active';}
   function stopRefresh(){if(timer){clearInterval(timer);timer=null;}autoOn=false;rb.textContent='OFF';rb.className='btn-toggle';}
   rb.addEventListener('click',function(){autoOn?stopRefresh():startRefresh();});
   ri.addEventListener('change',function(){if(autoOn)startRefresh();});
+  doRefresh();
   startRefresh();
 </script>
 </body></html>
-`, now, len(tasks), rows)
+`, now, HeartbeatTimeout)
 }
