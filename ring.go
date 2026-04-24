@@ -1,6 +1,9 @@
 package taskobserver
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -8,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"objstore"
 )
 
 const (
@@ -25,14 +30,16 @@ type RingLogger struct {
 	safeName string
 	runDir   string // tasks/<safeName>/logs/<runID>
 
-	buf      []string // 滑动窗口
-	pending  []string // 待上传缓冲
-	shardIdx int
+	buf       []string // 滑动窗口
+	pending   []string // 待上传缓冲
+	shardIdx  int
 	shardURLs []string
 
 	uploadWg sync.WaitGroup // 跟踪所有分片上传 goroutine
 
-	cos    *cosClient
+	store  objstore.Store
+	bucket string
+	region string
 	extra  io.Writer // 同时写到这里（如 os.Stderr）
 }
 
@@ -45,7 +52,6 @@ func safeName(taskName string) string {
 			sb.WriteRune('_')
 		}
 	}
-	// 去掉首尾下划线、并归连续下划线
 	s := strings.Trim(sb.String(), "_")
 	for strings.Contains(s, "__") {
 		s = strings.ReplaceAll(s, "__", "_")
@@ -67,10 +73,12 @@ func newRingLogger(taskName string, extra io.Writer) *RingLogger {
 	}
 }
 
-// setCOS 在 Observer 初始化后注入 COS 客户端（避免循环依赖）
-func (r *RingLogger) setCOS(c *cosClient) {
+// setStore 在 Observer 初始化后注入 store
+func (r *RingLogger) setStore(store objstore.Store, bucket, region string) {
 	r.mu.Lock()
-	r.cos = c
+	r.store = store
+	r.bucket = bucket
+	r.region = region
 	r.mu.Unlock()
 }
 
@@ -99,7 +107,7 @@ func (r *RingLogger) Write(p []byte) (int, error) {
 
 // uploadShard 异步压缩上传当前 pending（调用方需持锁）。
 func (r *RingLogger) uploadShard() {
-	if len(r.pending) == 0 || r.cos == nil {
+	if len(r.pending) == 0 || r.store == nil {
 		return
 	}
 	r.shardIdx++
@@ -108,15 +116,23 @@ func (r *RingLogger) uploadShard() {
 	copy(lines, r.pending)
 	r.pending = r.pending[:0]
 
-	c := r.cos
+	store := r.store
+	bucket := r.bucket
+	region := r.region
 	r.uploadWg.Add(1)
 	go func() {
 		defer r.uploadWg.Done()
-		if _, err := c.putGzip(key, lines); err != nil {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		for _, l := range lines {
+			io.WriteString(gz, l+"\n")
+		}
+		gz.Close()
+		if err := store.PutObject(context.Background(), key, buf.Bytes()); err != nil {
 			fmt.Fprintf(os.Stderr, "taskobserver: shard upload: %v\n", err)
 			return
 		}
-		cosURL := fmt.Sprintf("https://%s.cos.%s.myqcloud.com/%s", c.bucket, c.region, key)
+		cosURL := fmt.Sprintf("https://%s.cos-internal.%s.tencentcos.cn/%s", bucket, region, key)
 		r.mu.Lock()
 		r.shardURLs = append(r.shardURLs, cosURL)
 		r.mu.Unlock()
@@ -128,7 +144,7 @@ func (r *RingLogger) flush() {
 	r.mu.Lock()
 	r.uploadShard()
 	r.mu.Unlock()
-	r.uploadWg.Wait() // 真正等待所有分片上传 goroutine 返回
+	r.uploadWg.Wait()
 }
 
 func (r *RingLogger) window() []string {

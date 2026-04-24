@@ -112,9 +112,10 @@ func buildTaskHTML(taskName string, lines []string, current, total int, status S
   .toolbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
   .toolbar-left{font-size:12px;color:#888}
   .toolbar-right{display:flex;align-items:center;gap:10px}
-  .refresh-ctrl{display:flex;align-items:center;gap:4px;font-size:12px;color:#555}
-  .refresh-ctrl input{width:40px;padding:2px 4px;font-size:12px;border:1px solid #d0d0d0;border-radius:4px;text-align:center}
-  .btn-toggle{font-size:12px;padding:3px 10px;border-radius:4px;border:1px solid #d0d0d0;cursor:pointer;background:#fafafa;color:#444;transition:all .15s}
+  .refresh-ctrl{display:inline-flex;align-items:center;gap:4px;font-size:12px;color:#555}
+  .refresh-ctrl .label{white-space:nowrap}
+  .refresh-ctrl input{width:36px;padding:2px 4px;font-size:12px;border:1px solid #d0d0d0;border-radius:4px;text-align:center;flex-shrink:0}
+  .btn-toggle{font-size:12px;padding:0;width:36px;height:22px;line-height:22px;text-align:center;border-radius:4px;border:1px solid #d0d0d0;cursor:pointer;background:#fafafa;color:#444;box-sizing:border-box;flex-shrink:0;display:inline-block}
   .btn-toggle.active{background:#1677ff;color:#fff;border-color:#1677ff}
   .btn-download{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:5px 12px;border:1px solid #d0d0d0;border-radius:6px;background:#fafafa;color:#444;cursor:pointer;text-decoration:none;transition:background .15s}
   .btn-download:hover{background:#f0f0f0}
@@ -142,8 +143,7 @@ func buildTaskHTML(taskName string, lines []string, current, total int, status S
   <div class="toolbar">
     <span class="toolbar-left" id="log-count">最近 %d 行（窗口 %d）</span>
     <div class="toolbar-right">
-      <span class="refresh-ctrl">自动刷新 <input id="ri" type="number" value="3" min="1" max="60">秒
-      <button id="rb" class="btn-toggle active">ON</button></span>
+      <span class="refresh-ctrl"><span class="label">自动刷新</span><input id="ri" type="number" value="3" min="1" max="60"><span class="label">秒</span><button id="rb" class="btn-toggle active">ON</button></span>
       <a class="btn-download" id="dl" href="#" download="%s">⬇ 下载窗口日志</a>
     </div>
   </div>
@@ -181,8 +181,8 @@ func buildTaskHTML(taskName string, lines []string, current, total int, status S
       if(badge&&(badge.textContent.indexOf('Completed')>=0||badge.textContent.indexOf('Failed')>=0||badge.textContent.indexOf('Killed')>=0))stopRefresh();
     }).catch(function(){});
   }
-  function startRefresh(){if(timer)clearInterval(timer);timer=setInterval(doRefresh,getInterval());autoOn=true;rb.textContent='ON';rb.className='btn-toggle active';}
-  function stopRefresh(){if(timer){clearInterval(timer);timer=null;}autoOn=false;rb.textContent='OFF';rb.className='btn-toggle';}
+  function startRefresh(){if(timer)clearInterval(timer);timer=setInterval(doRefresh,getInterval());autoOn=true;rb.textContent='ON';rb.style.background='#1890ff';rb.style.color='white';rb.style.borderColor='#1890ff';}
+  function stopRefresh(){if(timer){clearInterval(timer);timer=null;}autoOn=false;rb.textContent='OFF';rb.style.background='#fafafa';rb.style.color='#444';rb.style.borderColor='#d0d0d0';}
   rb.addEventListener('click',function(){autoOn?stopRefresh():startRefresh();});
   ri.addEventListener('change',function(){if(autoOn)startRefresh();});
   %s

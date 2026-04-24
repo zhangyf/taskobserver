@@ -1,10 +1,13 @@
 package taskobserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
+
+	"objstore"
 )
 
 type taskMeta struct {
@@ -20,8 +23,8 @@ type taskMeta struct {
 
 var registryMu sync.Mutex
 
-func loadRegistry(c *cosClient) []taskMeta {
-	data, err := c.getJSON("tasks/registry.json")
+func loadRegistry(store objstore.Store) []taskMeta {
+	data, err := store.GetAll(context.Background(), "tasks/registry.json")
 	if err != nil || data == nil {
 		return nil
 	}
@@ -32,16 +35,16 @@ func loadRegistry(c *cosClient) []taskMeta {
 	return tasks
 }
 
-func saveRegistry(c *cosClient, tasks []taskMeta) error {
+func saveRegistry(store objstore.Store, tasks []taskMeta) error {
 	data, _ := json.MarshalIndent(tasks, "", "  ")
-	return c.putString("tasks/registry.json", "application/json; charset=utf-8", string(data))
+	return store.PutObject(context.Background(), "tasks/registry.json", data)
 }
 
-func upsertRegistry(c *cosClient, baseURL string, meta taskMeta) {
+func upsertRegistry(store objstore.Store, baseURL string, meta taskMeta) {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 
-	tasks := loadRegistry(c)
+	tasks := loadRegistry(store)
 	found := false
 	for i, t := range tasks {
 		if t.SafeName == meta.SafeName {
@@ -53,116 +56,187 @@ func upsertRegistry(c *cosClient, baseURL string, meta taskMeta) {
 	if !found {
 		tasks = append(tasks, meta)
 	}
-	if err := saveRegistry(c, tasks); err != nil {
+	if err := saveRegistry(store, tasks); err != nil {
 		fmt.Fprintf(os.Stderr, "taskobserver: save registry: %v\n", err)
 	}
 }
 
-func uploadIndexPage(c *cosClient, baseURL string) {
+func uploadIndexPage(store objstore.Store, baseURL string) {
 	registryMu.Lock()
-	tasks := loadRegistry(c)
+	_ = loadRegistry(store)
+	content := buildSimpleIndexHTML()
 	registryMu.Unlock()
-	content := buildIndexHTML(tasks, baseURL)
-	if err := c.putString("index.html", "text/html; charset=utf-8", content); err != nil {
+
+	if err := store.PutObject(context.Background(), "index.html", []byte(content)); err != nil {
 		fmt.Fprintf(os.Stderr, "taskobserver: upload index.html: %v\n", err)
 	}
 }
 
-func buildIndexHTML(_ []taskMeta, _ string) string {
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html lang="zh"><head><meta charset="utf-8"><title>任务总览</title>
+// buildSimpleIndexHTML 构建总览页（当天任务显示，历史任务默认折叠）
+func buildSimpleIndexHTML() string {
+	return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>任务总览</title>
 <style>
-  *{box-sizing:border-box}
-  body{background:#f0f2f5;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:24px}
-  .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:24px;max-width:960px;margin:0 auto;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
-  .title{font-size:18px;font-weight:600;color:#111}
-  .meta{font-size:12px;color:#888}
-  table{width:100%%;border-collapse:collapse}
-  th{text-align:left;font-size:12px;font-weight:600;color:#555;padding:8px 12px;border-bottom:2px solid #e8e8e8;background:#fafafa}
-  td{font-size:13px;padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
-  tr:last-child td{border-bottom:none}
-  tr:hover td{background:#fafafa}
-  td a{color:#1677ff;text-decoration:none;font-weight:500}
-  td a:hover{text-decoration:underline}
-  .mini-track{display:inline-block;width:80px;height:6px;background:#e8e8e8;border-radius:3px;overflow:hidden;vertical-align:middle;margin-right:6px}
-  .mini-bar{height:100%%;border-radius:3px}
-  .pct{font-size:12px;color:#888}
-  .toolbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:12px}
-  .refresh-ctrl{display:flex;align-items:center;gap:4px;font-size:12px;color:#555}
-  .refresh-ctrl input{width:40px;padding:2px 4px;font-size:12px;border:1px solid #d0d0d0;border-radius:4px;text-align:center}
-  .btn-toggle{font-size:12px;padding:3px 10px;border-radius:4px;border:1px solid #d0d0d0;cursor:pointer;background:#fafafa;color:#444;transition:all .15s}
-  .btn-toggle.active{background:#1677ff;color:#fff;border-color:#1677ff}
-</style></head><body>
-<div class="card">
+body{font-family:-apple-system,sans-serif;margin:20px;background:#f5f7fa;font-size:13px}
+.box{background:white;border-radius:8px;padding:20px;max-width:1000px;margin:0 auto}
+.header{display:flex;justify-content:space-between;margin-bottom:14px;align-items:center}
+.title{font-size:15px;font-weight:600}
+.meta{font-size:12px;color:#333;font-weight:500;background:#f0f0f0;padding:3px 8px;border-radius:4px}
+.ctrl{display:flex;justify-content:flex-end;margin-bottom:14px;font-size:12px;gap:6px;align-items:center}
+.ctrl input{width:36px;padding:3px 5px;border:1px solid #ddd;border-radius:3px;text-align:center}
+.btn{padding:3px 0;border:1px solid #ddd;border-radius:3px;cursor:pointer;background:#f5f5f5;width:36px;text-align:center;box-sizing:border-box}
+.btn.on{background:#1890ff;color:white;border-color:#1890ff}
+table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
+col.c-name{width:30%}
+col.c-status{width:14%}
+col.c-progress{width:14%}
+col.c-start{width:21%}
+col.c-end{width:21%}
+th{text-align:left;padding:7px 10px;background:#fafafa;border-bottom:2px solid #e8e8e8;color:#555;font-weight:600;overflow:hidden}
+td{padding:8px 10px;border-bottom:1px solid #f0f0f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+a{color:#1890ff;text-decoration:none}
+a:hover{text-decoration:underline}
+.prog-bar{display:inline-block;width:60px;height:5px;background:#e8e8e8;border-radius:3px;vertical-align:middle;margin-right:5px}
+.group-today td{background:#e6f7ff;color:#1890ff;font-weight:600;padding:9px 10px}
+.group-history td{background:#fff7e6;color:#d48806;font-weight:600;padding:9px 10px;cursor:pointer;user-select:none}
+.group-history:hover td{background:#ffefc9}
+</style>
+</head>
+<body>
+<div class="box">
   <div class="header">
-    <span class="title">📋 任务总览</span>
-    <span class="meta" id="meta">加载中...</span>
+    <div class="title">📋 任务总览</div>
+    <div class="meta" id="meta">正在加载...</div>
   </div>
-  <div class="toolbar">
-    <span class="refresh-ctrl">自动刷新 <input id="ri" type="number" value="5" min="1" max="60">秒
-    <button id="rb" class="btn-toggle active">ON</button></span>
+  <div class="ctrl">
+    自动刷新
+    <input id="interval" type="number" value="5" min="1" max="60">
+    秒
+    <button id="toggleBtn" class="btn on" onclick="toggleRefresh()">ON</button>
   </div>
   <table>
-    <thead><tr><th>任务名</th><th>状态</th><th>进度</th><th>开始时间</th><th>结束时间</th></tr></thead>
-    <tbody id="tbody"><tr><td colspan="5" style="text-align:center;color:#aaa;padding:32px">加载中...</td></tr></tbody>
+    <colgroup>
+      <col class="c-name"><col class="c-status"><col class="c-progress"><col class="c-start"><col class="c-end">
+    </colgroup>
+    <thead>
+      <tr><th>任务名</th><th>状态</th><th>进度</th><th>开始时间</th><th>结束时间</th></tr>
+    </thead>
+    <tbody id="body">
+      <tr><td colspan="5" style="text-align:center;padding:30px;color:#bbb">正在加载...</td></tr>
+    </tbody>
   </table>
 </div>
 <script>
-  var HEARTBEAT_TIMEOUT = %d;
-  var registryURL = location.href.replace(/\/index\.html(\?.*)?$/, '') + '/tasks/registry.json';
-  var timer=null, autoOn=true;
-  var rb=document.getElementById('rb'), ri=document.getElementById('ri');
-  function getInterval(){return Math.max(1,parseInt(ri.value)||5)*1000;}
-  function statusInfo(t) {
-    var now = Math.floor(Date.now()/1000);
-    if (t.status === 'running' && t.last_heartbeat > 0 && now - t.last_heartbeat > HEARTBEAT_TIMEOUT) {
-      return {icon:'💀', color:'#874d00', text:'Killed (no heartbeat)'};
-    }
-    switch(t.status) {
-      case 'completed': return {icon:'✅', color:'#52c41a', text:'Completed'};
-      case 'failed':    return {icon:'❌', color:'#cf1322', text:'Failed'};
-      case 'killed':    return {icon:'💀', color:'#874d00', text:'Killed'};
-      default:          return {icon:'🔄', color:'#1677ff', text:'Running'};
-    }
+var TIMEOUT = 120;
+var timer = null;
+var autoOn = true;
+var historyExpanded = false;
+var historyCount = 0;
+
+function statusInfo(s, hb) {
+  var now = Math.floor(Date.now() / 1000);
+  if (s === 'running' && hb > 0 && now - hb > TIMEOUT)
+    return { icon: '💀', text: '已终止(无心跳)', color: '#d48806' };
+  if (s === 'completed') return { icon: '✅', text: '已完成', color: '#52c41a' };
+  if (s === 'failed') return { icon: '❌', text: '失败', color: '#ff4d4f' };
+  if (s === 'killed') return { icon: '💀', text: '已终止', color: '#d48806' };
+  return { icon: '🔄', text: '运行中', color: '#1890ff' };
+}
+
+function render(tasks) {
+  if (!tasks || tasks.length === 0) {
+    document.getElementById('body').innerHTML = '<tr><td colspan="5" style="text-align:center;padding:30px;color:#bbb">暂无任务</td></tr>';
+    document.getElementById('meta').textContent = '最后更新：' + new Date().toLocaleString() + ' | 共 0 个任务';
+    return;
   }
-  function render(tasks) {
-    var tbody = document.getElementById('tbody');
-    var meta  = document.getElementById('meta');
-    if (!tasks || tasks.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#aaa;padding:32px">暂无任务</td></tr>';
-      meta.textContent = '最后更新：' + new Date().toLocaleString() + ' | 共 0 个任务';
-      return;
-    }
-    var html = '';
-    tasks.forEach(function(t) {
-      var s = statusInfo(t);
+  var today = new Date().toISOString().slice(0, 10);
+  var todayRows = [], histRows = [];
+  tasks.forEach(function(t) {
+    if (t.start_time && t.start_time.startsWith(today)) todayRows.push(t);
+    else histRows.push(t);
+  });
+  historyCount = histRows.length;
+  var html = '';
+  html += '<tr class="group-today"><td colspan="5">📅 今天（' + todayRows.length + ' 个任务）</td></tr>';
+  todayRows.forEach(function(t) {
+    var si = statusInfo(t.status, t.last_heartbeat || 0);
+    var pct = t.progress || 0;
+    html += '<tr>'
+      + '<td><a href="' + t.page_url + '" target="_blank">' + t.name + '</a></td>'
+      + '<td style="color:' + si.color + '">' + si.icon + ' ' + si.text + '</td>'
+      + '<td><div class="prog-bar"><div style="width:' + pct + '%;height:100%;background:' + si.color + ';border-radius:3px"></div></div>' + pct + '%</td>'
+      + '<td>' + (t.start_time || '-') + '</td>'
+      + '<td>' + (t.end_time || '-') + '</td>'
+      + '</tr>';
+  });
+  if (histRows.length > 0) {
+    var icon = historyExpanded ? '▼' : '▶';
+    html += '<tr class="group-history" onclick="toggleHistory()">'
+          + '<td colspan="5"><span id="hIcon">' + icon + '</span>&nbsp;🗓️ 历史任务（' + histRows.length + ' 个）</td>'
+          + '</tr>';
+    histRows.forEach(function(t, i) {
+      var si = statusInfo(t.status, t.last_heartbeat || 0);
       var pct = t.progress || 0;
-      var end = t.end_time || '-';
-      html += '<tr>';
-      html += '<td><a href="' + t.page_url + '" target="_blank">' + t.name + '</a></td>';
-      html += '<td><span style="color:' + s.color + ';font-weight:500">' + s.icon + ' ' + s.text + '</span></td>';
-      html += '<td><div class="mini-track"><div class="mini-bar" style="width:' + pct + '%%;background:' + s.color + '"></div></div><span class="pct">' + pct + '%%</span></td>';
-      html += '<td>' + (t.start_time || '-') + '</td>';
-      html += '<td>' + end + '</td>';
-      html += '</tr>';
+      var display = historyExpanded ? '' : 'none';
+      html += '<tr id="hr_' + i + '" style="display:' + display + '">'
+        + '<td style="background:#fffdf5"><a href="' + t.page_url + '" target="_blank">' + t.name + '</a></td>'
+        + '<td style="background:#fffdf5;color:' + si.color + '">' + si.icon + ' ' + si.text + '</td>'
+        + '<td style="background:#fffdf5"><div class="prog-bar"><div style="width:' + pct + '%;height:100%;background:' + si.color + ';border-radius:3px"></div></div>' + pct + '%</td>'
+        + '<td style="background:#fffdf5">' + (t.start_time || '-') + '</td>'
+        + '<td style="background:#fffdf5">' + (t.end_time || '-') + '</td>'
+        + '</tr>';
     });
-    tbody.innerHTML = html;
-    meta.textContent = '最后更新：' + new Date().toLocaleString() + ' | 共 ' + tasks.length + ' 个任务';
   }
-  function doRefresh() {
-    fetch(registryURL + '?t=' + Date.now())
-      .then(function(r){return r.json();})
-      .then(function(tasks){render(tasks);})
-      .catch(function(){});
+  document.getElementById('body').innerHTML = html;
+  document.getElementById('meta').textContent = '最后更新：' + new Date().toLocaleString()
+    + ' | 今天: ' + todayRows.length + ' | 历史: ' + histRows.length + ' | 总计: ' + tasks.length + ' 个任务';
+}
+
+function toggleHistory() {
+  historyExpanded = !historyExpanded;
+  var icon = document.getElementById('hIcon');
+  if (icon) icon.textContent = historyExpanded ? '▼' : '▶';
+  for (var i = 0; i < historyCount; i++) {
+    var row = document.getElementById('hr_' + i);
+    if (row) row.style.display = historyExpanded ? '' : 'none';
   }
-  function startRefresh(){if(timer)clearInterval(timer);timer=setInterval(doRefresh,getInterval());autoOn=true;rb.textContent='ON';rb.className='btn-toggle active';}
-  function stopRefresh(){if(timer){clearInterval(timer);timer=null;}autoOn=false;rb.textContent='OFF';rb.className='btn-toggle';}
-  rb.addEventListener('click',function(){autoOn?stopRefresh():startRefresh();});
-  ri.addEventListener('change',function(){if(autoOn)startRefresh();});
-  doRefresh();
-  startRefresh();
+}
+
+function loadTasks() {
+  fetch('./tasks/registry.json?t=' + Date.now())
+    .then(function(r) { return r.json(); })
+    .then(function(tasks) { render(tasks); })
+    .catch(function(e) { document.getElementById('meta').textContent = '加载失败: ' + e.message; });
+}
+
+function toggleRefresh() {
+  if (autoOn) {
+    clearInterval(timer); timer = null; autoOn = false;
+    document.getElementById('toggleBtn').textContent = 'OFF';
+    document.getElementById('toggleBtn').className = 'btn';
+  } else {
+    startTimer(); autoOn = true;
+    document.getElementById('toggleBtn').textContent = 'ON';
+    document.getElementById('toggleBtn').className = 'btn on';
+  }
+}
+
+function startTimer() {
+  if (timer) clearInterval(timer);
+  var sec = parseInt(document.getElementById('interval').value) || 5;
+  timer = setInterval(loadTasks, sec * 1000);
+}
+
+document.getElementById('interval').addEventListener('change', function() {
+  if (autoOn) startTimer();
+});
+
+loadTasks();
+startTimer();
 </script>
-</body></html>
-`, HeartbeatTimeout)
+</body>
+</html>`
 }

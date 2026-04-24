@@ -9,6 +9,7 @@
 package taskobserver
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"objstore"
 )
 
 // Status 任务状态
@@ -67,22 +70,22 @@ func (c *Config) fillDefaults() error {
 		c.Interval = 5 * time.Second
 	}
 	if c.BaseURL == "" {
-		c.BaseURL = fmt.Sprintf("https://%s.cos.%s.myqcloud.com", c.Bucket, c.Region)
+		c.BaseURL = fmt.Sprintf("https://%s.cos-internal.%s.tencentcos.cn", c.Bucket, c.Region)
 	}
 	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	return nil
 }
 
-// Observer 是核心对象，持有 RingLogger、COS 客户端和推送循环。
+// Observer 是核心对象，持有 RingLogger、objstore.Store 和推送循环。
 type Observer struct {
-	cfg        Config
-	cos        *cosClient
-	rl         *RingLogger
-	progressFn func() (int, int)
-	doneCh     chan struct{}
-	finishedCh chan struct{} // watchLoop 完成后关闭
+	cfg         Config
+	store       objstore.Store
+	rl          *RingLogger
+	progressFn  func() (int, int)
+	doneCh      chan struct{}
+	finishedCh  chan struct{}
 	finalStatus Status
-	startTime  string
+	startTime   string
 }
 
 // New 创建一个 Observer，失败时 panic。
@@ -99,12 +102,24 @@ func NewWithError(cfg Config) (*Observer, error) {
 	if err := cfg.fillDefaults(); err != nil {
 		return nil, err
 	}
-	c := newCOSClient(cfg.Bucket, cfg.Region, cfg.SecretID, cfg.SecretKey)
+
+	store, err := objstore.New(objstore.Config{
+		Provider:  objstore.ProviderCOS,
+		Bucket:    cfg.Bucket,
+		Region:    cfg.Region,
+		SecretID:  cfg.SecretID,
+		SecretKey: cfg.SecretKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建 objstore 失败: %w", err)
+	}
+
 	rl := newRingLogger(cfg.TaskName, cfg.ExtraWriter)
-	rl.setCOS(c)
+	rl.setStore(store, cfg.Bucket, cfg.Region)
+
 	return &Observer{
 		cfg:         cfg,
-		cos:         c,
+		store:       store,
 		rl:          rl,
 		doneCh:      make(chan struct{}),
 		finishedCh:  make(chan struct{}),
@@ -123,14 +138,11 @@ func (o *Observer) NewSlogLogger() *slog.Logger {
 }
 
 // Start 启动后台推送循环，并注册信号处理（SIGTERM/SIGINT → killed）。
-// progressFn 每次推送前调用，返回 (current, total)；传 nil 则进度条不动。
-// Start 是非阻塞的，立即返回。
 func (o *Observer) Start(progressFn func() (int, int)) {
 	o.progressFn = progressFn
 	o.startTime = time.Now().Format("2006-01-02 15:04:05")
 
-	// 注册任务到总览页
-	upsertRegistry(o.cos, o.cfg.BaseURL, taskMeta{
+	upsertRegistry(o.store, o.cfg.BaseURL, taskMeta{
 		Name:          o.cfg.TaskName,
 		SafeName:      o.rl.safeName,
 		Status:        string(StatusRunning),
@@ -139,9 +151,8 @@ func (o *Observer) Start(progressFn func() (int, int)) {
 		PageURL:       o.taskPageURL(),
 		LastHeartbeat: time.Now().Unix(),
 	})
-	uploadIndexPage(o.cos, o.cfg.BaseURL)
+	uploadIndexPage(o.store, o.cfg.BaseURL)
 
-	// 监听 SIGTERM / SIGINT，写入 killed 状态后退出
 	go o.handleSignals()
 	go o.watchLoop()
 }
@@ -178,6 +189,11 @@ func (o *Observer) TaskURL() string {
 	return o.taskPageURL()
 }
 
+// DeleteTask 删除任务（归档数据到指定路径）
+func (o *Observer) DeleteTask(taskSafeName string, archivePath string) error {
+	return deleteTask(o.store, o.cfg.Bucket, o.cfg.Region, o.cfg.BaseURL, taskSafeName, archivePath)
+}
+
 func (o *Observer) taskPageURL() string {
 	return fmt.Sprintf("%s/tasks/%s/index.html", o.cfg.BaseURL, o.rl.safeName)
 }
@@ -186,7 +202,6 @@ func (o *Observer) taskPageKey() string {
 	return fmt.Sprintf("tasks/%s/index.html", o.rl.safeName)
 }
 
-// handleSignals 捕获 SIGTERM/SIGINT，将状态置为 killed 后触发 watchLoop 结束。
 func (o *Observer) handleSignals() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
@@ -194,7 +209,6 @@ func (o *Observer) handleSignals() {
 	fmt.Fprintf(os.Stderr, "\ntaskobserver: received signal %v, marking task as killed\n", sig)
 	o.Log("进程收到信号，任务标记为 killed", "signal", sig.String())
 	o.finalStatus = StatusKilled
-	// 关闭 doneCh 触发 watchLoop 最终推送（如果还没关闭）
 	select {
 	case <-o.doneCh:
 	default:
@@ -216,12 +230,10 @@ func (o *Observer) watchLoop() {
 		if tot > 0 {
 			pct = cur * 100 / tot
 		}
-		isDone := status != StatusRunning
-		if isDone {
+		if status != StatusRunning {
 			pct = 100
 		}
 		if status == StatusKilled || status == StatusFailed {
-			// killed/failed 保留真实进度，不强制100%
 			if tot > 0 {
 				pct = cur * 100 / tot
 			}
@@ -230,15 +242,15 @@ func (o *Observer) watchLoop() {
 		lines := o.rl.window()
 		shards := o.rl.shards()
 		page := buildTaskHTML(o.cfg.TaskName, lines, cur, tot, status, shards)
-		if err := o.cos.putString(o.taskPageKey(), "text/html; charset=utf-8", page); err != nil {
+		if err := o.store.PutObject(context.Background(), o.taskPageKey(), []byte(page)); err != nil {
 			fmt.Fprintf(os.Stderr, "taskobserver: upload task page: %v\n", err)
 		}
 
 		endTime := ""
-		if isDone {
+		if status != StatusRunning {
 			endTime = time.Now().Format("2006-01-02 15:04:05")
 		}
-		upsertRegistry(o.cos, o.cfg.BaseURL, taskMeta{
+		upsertRegistry(o.store, o.cfg.BaseURL, taskMeta{
 			Name:          o.cfg.TaskName,
 			SafeName:      o.rl.safeName,
 			Status:        string(status),
@@ -248,7 +260,7 @@ func (o *Observer) watchLoop() {
 			PageURL:       o.taskPageURL(),
 			LastHeartbeat: time.Now().Unix(),
 		})
-		uploadIndexPage(o.cos, o.cfg.BaseURL)
+		uploadIndexPage(o.store, o.cfg.BaseURL)
 	}
 
 	for {
@@ -273,4 +285,68 @@ func ConfigFromEnv() Config {
 		BaseURL:   os.Getenv("TASKOBS_BASE_URL"),
 		TaskName:  os.Getenv("TASKOBS_TASK"),
 	}
+}
+
+// deleteTask 删除任务并归档数据
+func deleteTask(store objstore.Store, bucket, region, baseURL, taskSafeName, archivePath string) error {
+	if archivePath == "" {
+		archivePath = "archive"
+	}
+	archivePath = strings.TrimSuffix(archivePath, "/") + "/"
+
+	// 1. 从注册表中移除任务
+	registryMu.Lock()
+	tasks := loadRegistry(store)
+	var newTasks []taskMeta
+	var found bool
+	for _, task := range tasks {
+		if task.SafeName == taskSafeName {
+			found = true
+			continue
+		}
+		newTasks = append(newTasks, task)
+	}
+	if !found {
+		registryMu.Unlock()
+		return fmt.Errorf("任务未找到: %s", taskSafeName)
+	}
+	if err := saveRegistry(store, newTasks); err != nil {
+		registryMu.Unlock()
+		return fmt.Errorf("保存注册表失败: %v", err)
+	}
+	registryMu.Unlock()
+
+	// 2. 列出任务文件并归档
+	ctx := context.Background()
+	taskPrefix := "tasks/" + taskSafeName + "/"
+	objects, err := store.ListObjects(ctx, taskPrefix)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "taskobserver: 列出任务文件失败: %v\n", err)
+	} else {
+		for _, key := range objects {
+			data, err := store.GetAll(ctx, key)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "taskobserver: 读取文件失败 %s: %v\n", key, err)
+				continue
+			}
+			destKey := archivePath + key
+			if err := store.PutObject(ctx, destKey, data); err != nil {
+				fmt.Fprintf(os.Stderr, "taskobserver: 归档失败 %s -> %s: %v\n", key, destKey, err)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "taskobserver: 已归档: %s -> %s\n", key, destKey)
+		}
+	}
+
+	// 3. 创建归档标记
+	marker := archivePath + taskPrefix + "deleted_at.txt"
+	content := fmt.Sprintf("归档时间: %s\n原位置: %s\n归档路径: %s\n",
+		time.Now().Format("2006-01-02 15:04:05"), taskPrefix, archivePath)
+	store.PutObject(ctx, marker, []byte(content)) //nolint:errcheck
+
+	// 4. 更新总览页
+	uploadIndexPage(store, baseURL)
+
+	fmt.Fprintf(os.Stderr, "taskobserver: 任务删除完成: %s (归档到 %s)\n", taskSafeName, archivePath)
+	return nil
 }
